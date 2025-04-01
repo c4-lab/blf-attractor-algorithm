@@ -29,13 +29,292 @@ def log_execution_time(func):
         return result
     return wrapper
 
-
-
-class DiscreteVectorFieldAnalyzer:
-    def __init__(self, df, interpolation_factor=1, base_flow_threshold=1e-6, enable_logging=False):
+class ForwardTrajectoryAttractorAnalyzer:
+    """
+    An analyzer that extracts attractors from a vector field by analyzing forward trajectories.
+    
+    This class computes trajectories in the forward direction from grid points,
+    extracts a short terminal segment from each trajectory to measure curvature,
+    and then clusters the endpoints (augmented with curvature information) to
+    identify distinct attractors. The basin of attraction is then the union of all
+    trajectories that lead to each attractor.
+    """
+    def __init__(self, df, interpolation_factor=1, base_flow_threshold=1e-6, divergence_threshold=0.7,
+                 terminal_segment_length=5, sensitivity=1.0, enable_logging=False):
         self.df = df
         self.interpolation_factor = interpolation_factor
         self.base_flow_threshold = base_flow_threshold
+        self.divergence_threshold = divergence_threshold
+        self.terminal_segment_length = terminal_segment_length
+        self.sensitivity = sensitivity
+
+        self.logger = logging.getLogger(f"{self.__class__.__name__}")
+        self.logger.setLevel(logging.INFO if enable_logging else logging.WARNING)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+
+        self.trajectories = []          # List of forward trajectories (each a list of (i,j) indices)
+        self.trajectory_endpoints = []  # List of endpoint coordinates (x,y)
+        self.endpoint_curvatures = []   # Curvature measures from the terminal segments
+        self.attractors = None          # Representative attractor positions (centroid or medoid)
+        self.basins = None              # Basin assignments for each grid cell
+
+        self._prepare_data()
+        x_range = self.x_fine.max() - self.x_fine.min()
+        y_range = self.y_fine.max() - self.y_fine.min()
+        self.base_step_size = min(
+            x_range / (len(self.x_fine) - 1),
+            y_range / (len(self.y_fine) - 1)
+        ) / 2
+
+    def _prepare_data(self):
+        """Interpolate the vector field on a fine grid and compute a validity mask."""
+        x = self.df['from_x'].values
+        y = self.df['from_y'].values
+        u = self.df['mu_dx'].values
+        v = self.df['mu_dy'].values
+
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+
+        # Center grid cells
+        step_size_field = (x_max - x_min) / (self.interpolation_factor * (x_max - x_min) - 1)
+        self.x_fine = np.linspace(x_min, x_max, int((x_max - x_min) * self.interpolation_factor), endpoint=True) + (step_size_field / 2)
+        self.y_fine = np.linspace(y_min, y_max, int((y_max - y_min) * self.interpolation_factor), endpoint=True) + (step_size_field / 2)
+        self.X_fine, self.Y_fine = np.meshgrid(self.x_fine, self.y_fine)
+
+        # Interpolation using Delaunay triangulation
+        points = np.column_stack((x, y))
+        tri = Delaunay(points)
+        self.U_interp = LinearNDInterpolator(points, u, fill_value=np.nan)
+        self.V_interp = LinearNDInterpolator(points, v, fill_value=np.nan)
+        self.U_fine = self.U_interp(self.X_fine, self.Y_fine)
+        self.V_fine = self.V_interp(self.X_fine, self.Y_fine)
+
+        fine_points = np.column_stack((self.X_fine.ravel(), self.Y_fine.ravel()))
+        in_simplex = tri.find_simplex(fine_points) >= 0
+        has_valid_values = ~np.isnan(self.U_fine.ravel()) & ~np.isnan(self.V_fine.ravel())
+        self.valid_mask = (in_simplex & has_valid_values).reshape(self.X_fine.shape)
+        self.U_fine[~self.valid_mask] = np.nan
+        self.V_fine[~self.valid_mask] = np.nan
+        self.grid_shape = self.X_fine.shape
+
+    def discretize_point(self, point):
+        """Convert a continuous point to grid indices."""
+        j = np.clip(np.searchsorted(self.x_fine, point[0]), 0, len(self.x_fine)-1)
+        i = np.clip(np.searchsorted(self.y_fine, point[1]), 0, len(self.y_fine)-1)
+        return int(i), int(j)
+
+    def rk4_step(self, x, y, step_size, U, V):
+        """Perform a single RK4 integration step."""
+        k1x = U(x, y)
+        k1y = V(x, y)
+        k2x = U(x + 0.5 * step_size * k1x, y + 0.5 * step_size * k1y)
+        k2y = V(x + 0.5 * step_size * k1x, y + 0.5 * step_size * k1y)
+        k3x = U(x + 0.5 * step_size * k2x, y + 0.5 * step_size * k2y)
+        k3y = V(x + 0.5 * step_size * k2x, y + 0.5 * step_size * k2y)
+        k4x = U(x + step_size * k3x, y + step_size * k3y)
+        k4y = V(x + step_size * k3x, y + step_size * k3y)
+        x_next = x + (step_size / 6.0) * (k1x + 2*k2x + 2*k3x + k4x)
+        y_next = y + (step_size / 6.0) * (k1y + 2*k2y + 2*k3y + k4y)
+        return x_next, y_next
+
+    def generate_trajectory(self, start_index, max_steps=1000):
+        """
+        Generate a forward trajectory starting from a grid index.
+        Integration stops if:
+          - The point leaves the valid grid.
+          - The local flow magnitude drops below a threshold.
+          - The trajectory loops.
+        """
+        trajectory = [start_index]
+        i, j = start_index
+        x = self.X_fine[i, j]
+        y = self.Y_fine[i, j]
+        
+        visited = set([start_index])
+        step_size = self.base_step_size / self.sensitivity
+
+        def U_func(x, y):
+            ii, jj = self.discretize_point((x, y))
+            if np.isnan(self.U_fine[ii, jj]):
+                return 0.0
+            return self.U_fine[ii, jj]
+        def V_func(x, y):
+            ii, jj = self.discretize_point((x, y))
+            if np.isnan(self.V_fine[ii, jj]):
+                return 0.0
+            return self.V_fine[ii, jj]
+            
+        for _ in range(max_steps):
+            ii, jj = self.discretize_point((x, y))
+            if not (0 <= ii < self.grid_shape[0] and 0 <= jj < self.grid_shape[1]):
+                break
+            if not self.valid_mask[ii, jj]:
+                break
+
+            # Stop if flow magnitude is too low (i.e. converged to an attractor)
+            flow_mag = np.hypot(U_func(x, y), V_func(x, y))
+            if flow_mag < self.base_flow_threshold:
+                self.logger.info(f"Trajectory stopped at grid ({ii},{jj}) with flow {flow_mag:.3e}")
+                break
+
+            x_next, y_next = self.rk4_step(x, y, step_size, U_func, V_func)
+            ii_next, jj_next = self.discretize_point((x_next, y_next))
+            if not (0 <= ii_next < self.grid_shape[0] and 0 <= jj_next < self.grid_shape[1]):
+                break
+            if not self.valid_mask[ii_next, jj_next]:
+                break
+            if (ii_next, jj_next) in visited:
+                break
+            visited.add((ii_next, jj_next))
+            trajectory.append((ii_next, jj_next))
+            x, y = x_next, y_next
+
+        return trajectory
+
+    def compute_terminal_curvature(self, trajectory):
+        """
+        Compute an average curvature for the terminal segment of the trajectory.
+        Only the last terminal_segment_length points are used.
+        """
+        if len(trajectory) < self.terminal_segment_length + 1:
+            return 0.0
+        # Convert grid indices to continuous coordinates
+        points = []
+        for idx in trajectory[-(self.terminal_segment_length+1):]:
+            i, j = idx
+            points.append((self.X_fine[i, j], self.Y_fine[i, j]))
+        points = np.array(points)
+        angles = []
+        for k in range(1, len(points)):
+            dx = points[k][0] - points[k-1][0]
+            dy = points[k][1] - points[k-1][1]
+            angles.append(np.arctan2(dy, dx))
+        angles = np.array(angles)
+        angle_diffs = np.diff(angles)
+        angle_diffs = (angle_diffs + np.pi) % (2 * np.pi) - np.pi  # Wrap to [-pi, pi]
+        curvature = np.mean(np.abs(angle_diffs))
+        return curvature
+
+    @log_execution_time
+    def analyze_forward_attractors(self):
+        """
+        Complete pipeline:
+         1. Compute forward trajectories from valid grid points.
+         2. Extract endpoint coordinates and compute terminal curvature.
+         3. Cluster endpoints augmented with curvature information.
+         4. Define attractors (centroids or medoids) and basins as all trajectories belonging to each attractor.
+        
+        Returns:
+            attractors: (N x 2) array of attractor positions.
+            basins: 2D array mapping grid cells to attractor labels.
+        """
+        valid_indices = list(zip(*np.where(self.valid_mask)))
+        self.logger.info(f"Computing trajectories from {len(valid_indices)} valid grid points.")
+
+        endpoints = []
+        curvatures = []
+        traj_collection = []
+        for idx in valid_indices:
+            traj = self.generate_trajectory(idx)
+            if len(traj) == 0:
+                continue
+            traj_collection.append(traj)
+            # Use the last grid point as the endpoint
+            end_i, end_j = traj[-1]
+            endpoints.append((self.X_fine[end_i, end_j], self.Y_fine[end_i, end_j]))
+            curvature = self.compute_terminal_curvature(traj)
+            curvatures.append(curvature)
+
+        self.trajectories = traj_collection
+        self.trajectory_endpoints = np.array(endpoints)
+        self.endpoint_curvatures = np.array(curvatures)
+
+        if len(endpoints) < 2:
+            self.logger.warning("Not enough endpoints for clustering.")
+            self.basins = np.full(self.grid_shape, -1, dtype=int)
+            return np.array([]), self.basins
+
+        # Form feature vector: [x, y, curvature_scaled]
+        spatial_features = self.trajectory_endpoints
+        curvature_feature = self.endpoint_curvatures.reshape(-1, 1)
+        curvature_scale = self.sensitivity  # Adjust to weight curvature vs. spatial coordinates
+        combined_features = np.hstack([spatial_features, curvature_scale * curvature_feature])
+
+        # Cluster using DBSCAN
+        avg_spacing = np.mean([self.x_fine[1] - self.x_fine[0], self.y_fine[1] - self.y_fine[0]])
+        eps = avg_spacing * 2 / self.sensitivity
+        clustering = DBSCAN(eps=eps, min_samples=1).fit(combined_features)
+        labels = clustering.labels_
+        unique_labels = np.unique(labels)
+        self.logger.info(f"Clustering produced {len(unique_labels)} clusters.")
+
+        # Compute attractors as centroids of clusters
+        attractors = []
+        for label in unique_labels:
+            mask = (labels == label)
+            cluster_points = spatial_features[mask]
+            centroid = np.mean(cluster_points, axis=0)
+            attractors.append(centroid)
+        attractors = np.array(attractors)
+        self.attractors = attractors
+
+        # Assign each valid grid cell (that is part of any trajectory) to the nearest attractor.
+        basin_map = np.full(self.grid_shape, -1, dtype=int)
+        if attractors.size > 0:
+            tree = cKDTree(attractors)
+            # For each trajectory endpoint, assign all grid points along the trajectory to that attractor.
+            for traj, label in zip(traj_collection, labels):
+                # Find the representative attractor label for this endpoint.
+                _, attractor_label = tree.query(self.trajectory_endpoints[0])
+                # Alternatively, you can simply use the cluster label from DBSCAN.
+                for (i, j) in traj:
+                    basin_map[i, j] = label
+        self.basins = basin_map
+        return attractors, basin_map
+
+    def plot_trajectory_endpoints(self, figsize=(12, 10)):
+        """Plot the endpoints colored by cluster."""
+        plt.figure(figsize=figsize)
+        plt.scatter(self.trajectory_endpoints[:, 0], self.trajectory_endpoints[:, 1],
+                    c='blue', s=50, alpha=0.7, label='Endpoints')
+        if self.attractors is not None:
+            plt.scatter(self.attractors[:, 0], self.attractors[:, 1],
+                        c='red', s=100, label='Attractors')
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.title("Trajectory Endpoints and Attractors")
+        plt.legend()
+        plt.show()
+
+    def plot_basins(self, figsize=(12, 10)):
+        """Visualize the basins of attraction over the vector field."""
+        plt.figure(figsize=figsize)
+        plt.imshow(self.basins, extent=[self.x_fine.min(), self.x_fine.max(),
+                                        self.y_fine.min(), self.y_fine.max()],
+                   origin='lower', alpha=0.6, cmap='viridis')
+        plt.streamplot(self.X_fine, self.Y_fine, self.U_fine, self.V_fine,
+                       density=2, color='gray', arrowsize=1)
+        if self.attractors is not None:
+            plt.scatter(self.attractors[:, 0], self.attractors[:, 1],
+                        c='red', s=100, label='Attractors')
+        plt.xlabel("X")
+        plt.ylabel("Y")
+        plt.title("Basins of Attraction")
+        plt.legend()
+        plt.show()
+
+class DiscreteVectorFieldAnalyzer:
+    def __init__(self, df, interpolation_factor=1, base_flow_threshold=1e-6, divergence_threshold = .7, enable_logging=False):
+        self.df = df
+        self.interpolation_factor = interpolation_factor
+        self.base_flow_threshold = base_flow_threshold
+        self.divergence_threshold = divergence_threshold
 
         self.logger = logging.getLogger(f"{self.__class__.__name__}")
         self.logger.setLevel(logging.INFO if enable_logging else logging.WARNING)
@@ -176,7 +455,7 @@ class DiscreteVectorFieldAnalyzer:
                     #self.logger.info(f"Direction change at ({i},{j}): max_change={max_change:.3f}rad, flow_mag={delta_mag:.3e}")
                     # Check neighborhood for divergent flows
                     neighborhood = self.get_neighborhood_flows(i, j, radius=2)
-                    if self.is_divergent_region(neighborhood):
+                    if self.is_divergent_region(neighborhood,self.divergence_threshold):
                         self.logger.info(f"Stopping at ({i},{j}): divergent region detected")
                         break  # Stop at potential separatrix
             
@@ -310,129 +589,190 @@ class DiscreteVectorFieldAnalyzer:
         return np.array([self.U_fine[i, j], self.V_fine[i, j]])
 
 
-    def find_attractors_and_basins(self, trajectories, sensitivity=1.0):
+    def find_attractors_and_basins(self, sensitivity=1.0, min_samples=5, similarity_threshold=0.7):
         """
-        Identify attractors and their basins using adaptive parameters based on grid properties.
+        Find attractors and their basins using trajectory-based clustering.
         
         Args:
-            trajectories: List of trajectories from analyze_vector_field
-            sensitivity: Controls clustering parameters, higher values allow smaller, more numerous attractors
-        """
-        valid_indices = list(zip(*np.where(self.valid_mask)))
-        
-        # Extract endpoints and their properties
-        endpoints = []
-        endpoint_flows = []
-        trajectory_lengths = []  # Store trajectory lengths for quality assessment
-        
-        for traj in trajectories:
-            if len(traj) > 0:
-                end_i, end_j = traj[-1]
-                endpoints.append((self.X_fine[end_i, end_j], self.Y_fine[end_i, end_j]))
-                
-                # Get flow magnitude at endpoint
-                u = self.U_fine[end_i, end_j]
-                v = self.V_fine[end_i, end_j]
-                flow_mag = np.hypot(u, v)
-                endpoint_flows.append(flow_mag)
-                trajectory_lengths.append(len(traj))
-        
-        # Store for visualization
-        self.trajectory_endpoints = np.array(endpoints)
-        self.endpoint_flows = np.array(endpoint_flows)
-        
-        if len(endpoints) < 2:
-            return [], np.zeros(self.grid_shape, dtype=int)
+            sensitivity (float): Controls precision of trajectory generation
+            min_samples (int): Minimum number of trajectories to form an attractor cluster
+            similarity_threshold (float): Threshold for trajectory similarity (0-1)
             
-        # Calculate grid-based parameters
-        avg_grid_spacing = np.mean([
-            self.x_fine[1] - self.x_fine[0],
-            self.y_fine[1] - self.y_fine[0]
-        ])
-        
-        # Scale DBSCAN parameters with sensitivity
-        eps = avg_grid_spacing * 2 / sensitivity
-        min_samples = max(3, int(np.pi * (eps/avg_grid_spacing)**2))
-        min_quality = int(np.sqrt(self.grid_shape[0] * self.grid_shape[1]) / sensitivity)
-        
-        # Perform single DBSCAN clustering
-        clustering = DBSCAN(eps=eps, min_samples=min_samples).fit(endpoints)
-        labels = clustering.labels_
-        
-        # Store raw clustering results for visualization
-        self.endpoint_clusters = labels.copy()  # Store before pruning
-        
-        unique_labels = np.unique(labels)
-        self.logger.info(f"Initial clusters found: {len(unique_labels[unique_labels != -1])}")
-        
-        # Process clusters and identify attractors
-        attractors = []
-        valid_labels = {}  # Dictionary to map DBSCAN labels to new attractor indices
-        new_label = 0
-        
-        # Store cluster qualities for visualization
-        self.cluster_qualities = {label: 0 for label in unique_labels if label != -1}
-        
-        for label in unique_labels:
-            if label != -1:  # -1 is noise in DBSCAN
-                cluster_mask = (labels == label)
-                cluster_points = np.array(endpoints)[cluster_mask]
-                
-                # Calculate cluster quality (sum of trajectory lengths)
-                quality = sum(traj_len for traj_len, is_in_cluster 
-                            in zip(trajectory_lengths, cluster_mask) if is_in_cluster)
-                
-                self.cluster_qualities[label] = quality
-                
-                if quality > min_quality:
-                    attractors.append(np.mean(cluster_points, axis=0))
-                    valid_labels[label] = new_label
-                    new_label += 1
-                else:
-                    self.logger.info(f"Cluster {label} pruned: quality {quality} < threshold {min_quality}")
-        
-        attractors = np.array(attractors)
-        self.logger.info(f"Final attractors after pruning: {len(attractors)}")
-        
-        # Update endpoint_clusters to reflect pruned clusters
-        pruned_clusters = self.endpoint_clusters.copy()
-        for label in unique_labels:
-            if label != -1 and label not in valid_labels:
-                pruned_clusters[self.endpoint_clusters == label] = -1
-        self.endpoint_clusters = pruned_clusters
-        
-        # Assign basins
+        Returns:
+            tuple: (attractors, basins)
+                - attractors: dict mapping attractor IDs to their properties
+                - basins: 2D array of attractor IDs for each point (-1 for no basin)
+        """
+        # Initialize basin array
         basins = np.full(self.grid_shape, -1, dtype=int)
-        for (i, j), label in zip(valid_indices, clustering.labels_):
-            basins[i, j] = valid_labels.get(label, -1)
         
-        # Fill pruned basins with nearest valid basin
-        valid_points = []
-        valid_labels_list = []
-        for i, j in valid_indices:
-            if basins[i, j] != -1:
-                valid_points.append((self.X_fine[i, j], self.Y_fine[i, j]))
-                valid_labels_list.append(basins[i, j])
+        # Generate and analyze trajectories
+        self.analyze_attractors(
+            sensitivity=sensitivity,
+            min_samples=min_samples,
+            similarity_threshold=similarity_threshold
+        )
         
-        if not valid_points:
-            self.logger.warning("All attractors were pruned.")
+        if self.endpoint_clusters is None or len(self.endpoint_clusters) == 0:
+            self.logger.warning("No clusters found in trajectory analysis")
+            return {}, basins
+            
+        # Create attractor dictionary
+        attractors = {}
+        for label in self.cluster_info.keys():
+            info = self.cluster_info[label]
+            
+            # Only consider clusters with sufficiently low speed as attractors
+            if info['min_speed'] > self.base_flow_threshold * 10:  # Adjustable threshold
+                continue
+                
+            attractors[label] = {
+                'center': info['center'],
+                'size': info['size'],
+                'avg_speed': info['avg_speed'],
+                'min_speed': info['min_speed']
+            }
+            
+        # If no valid attractors found, return empty results
+        if not attractors:
+            self.logger.warning("No valid attractors found")
             return attractors, basins
+            
+        # Generate trajectories from all valid points to identify basins
+        for i in range(self.grid_shape[0]):
+            for j in range(self.grid_shape[1]):
+                if not self.valid_mask[i,j]:
+                    continue
+                    
+                # Generate trajectory
+                traj = self.generate_trajectory_rk4((i,j), sensitivity)
+                if len(traj) < 3:
+                    continue
+                    
+                # Compute trajectory features
+                features = self.compute_trajectory_features(traj)
+                if features is None:
+                    continue
+                    
+                # Find the most similar attractor
+                best_similarity = -1
+                best_label = -1
+                
+                for label in attractors.keys():
+                    # Create a synthetic feature set for the attractor
+                    attractor_features = {
+                        'endpoint': attractors[label]['center'],
+                        'end_speed': attractors[label]['min_speed'],
+                        'center': attractors[label]['center'],
+                        'avg_radius': 0,  # Attractor is a point
+                        'radius_std': 0,
+                        'total_length': 0,
+                        'avg_speed': attractors[label]['avg_speed'],
+                        'min_speed': attractors[label]['min_speed']
+                    }
+                    
+                    sim = self.compute_trajectory_similarity(features, attractor_features)
+                    if sim > best_similarity:
+                        best_similarity = sim
+                        best_label = label
+                
+                # Assign point to basin if similarity exceeds threshold
+                if best_similarity > similarity_threshold * 0.8:  # Slightly lower threshold for basin assignment
+                    basins[i,j] = best_label
         
-        tree = cKDTree(valid_points)
-        
-        pruned_points = []
-        pruned_indices = []
-        for i, j in valid_indices:
-            if basins[i, j] == -1:
-                pruned_points.append((self.X_fine[i, j], self.Y_fine[i, j]))
-                pruned_indices.append((i, j))
-        
-        if pruned_points:
-            distances, indices = tree.query(pruned_points, k=1)
-            for (i, j), idx in zip(pruned_indices, indices):
-                basins[i, j] = valid_labels_list[idx]
+        # Store results
+        self.attractors = attractors
+        self.basins = basins
         
         return attractors, basins
+
+    def analyze_attractors(self, sensitivity=1.0, min_samples=5, similarity_threshold=0.7):
+        """
+        Analyze attractors using trajectory-based clustering.
+        
+        Args:
+            sensitivity (float): Controls precision of trajectory generation
+            min_samples (int): Minimum number of trajectories to form an attractor cluster
+            similarity_threshold (float): Threshold for trajectory similarity (0-1)
+        """
+        # Generate trajectories from each valid point
+        trajectories = []
+        start_points = []
+        
+        for i in range(self.grid_shape[0]):
+            for j in range(self.grid_shape[1]):
+                if self.valid_mask[i,j]:
+                    traj = self.generate_trajectory_rk4((i,j), sensitivity)
+                    if len(traj) > 2:  # Minimum trajectory length
+                        trajectories.append(traj)
+                        start_points.append((i,j))
+        
+        # Cluster trajectories
+        labels, features = self.cluster_trajectories(
+            trajectories,
+            min_samples=min_samples,
+            similarity_threshold=similarity_threshold
+        )
+        
+        # Store results
+        self.trajectory_endpoints = np.array([
+            features[i]['endpoint'] for i in range(len(features))
+            if features[i] is not None
+        ])
+        
+        self.endpoint_flows = np.array([
+            features[i]['end_speed'] for i in range(len(features))
+            if features[i] is not None
+        ])
+        
+        self.endpoint_clusters = labels
+        
+        # Store additional information about clusters
+        self.cluster_info = {}
+        for label in set(labels):
+            if label == -1:  # Noise points
+                continue
+                
+            cluster_mask = (labels == label)
+            cluster_features = [f for f, m in zip(features, cluster_mask) if m and f is not None]
+            
+            self.cluster_info[label] = {
+                'size': np.sum(cluster_mask),
+                'avg_speed': np.mean([f['avg_speed'] for f in cluster_features]),
+                'min_speed': np.min([f['min_speed'] for f in cluster_features]),
+                'center': np.mean([f['center'] for f in cluster_features], axis=0)
+            }
+        
+        return self.endpoint_clusters
+
+    def analyze_field(self, sensitivity=1.0, min_samples=5, similarity_threshold=0.7):
+        """
+        Main method to analyze the vector field and identify attractors and basins.
+        
+        Args:
+            sensitivity (float): Controls precision of trajectory generation
+            min_samples (int): Minimum number of trajectories to form an attractor cluster
+            similarity_threshold (float): Threshold for trajectory similarity (0-1)
+        """
+        self.attractors, self.basins = self.find_attractors_and_basins(
+            sensitivity=sensitivity,
+            min_samples=min_samples,
+            similarity_threshold=similarity_threshold
+        )
+        
+        # Log analysis results
+        n_attractors = len(self.attractors)
+        n_assigned = np.sum(self.basins >= 0)
+        total_valid = np.sum(self.valid_mask)
+        
+        self.logger.info(f"Found {n_attractors} attractors")
+        self.logger.info(f"Assigned {n_assigned}/{total_valid} points to basins")
+        
+        for label, attractor in self.attractors.items():
+            self.logger.info(f"Attractor {label}:")
+            self.logger.info(f"  Center: ({attractor['center'][0]:.2f}, {attractor['center'][1]:.2f})")
+            self.logger.info(f"  Size: {attractor['size']}")
+            self.logger.info(f"  Min Speed: {attractor['min_speed']:.2e}")
 
     def plot_trajectory_endpoints(self, with_clusters=True, with_flows=True, with_qualities=True, figsize=(12, 10)):
         """
@@ -496,7 +836,7 @@ class DiscreteVectorFieldAnalyzer:
                        self.trajectory_endpoints[:, 1],
                        s=sizes, alpha=0.6)
             
-        plt.title('Trajectory Endpoints\n(Showing pruned and valid clusters)')
+        plt.title('Trajectory Endpoints\n(Pruned clusters shown as noise)')
         if with_flows:
             plt.colorbar(label='Normalized Flow Magnitude')
         plt.xlabel('X')
@@ -504,20 +844,140 @@ class DiscreteVectorFieldAnalyzer:
         plt.tight_layout()
 
 
-    def analyze_field(self, sensitivity=1.0):
+    def compute_trajectory_features(self, trajectory):
         """
-        Complete analysis pipeline with a single control parameter.
+        Compute features for a trajectory that are invariant to direction.
         
         Args:
-            sensitivity: Float between 0.1 and 2.0 that controls the overall analysis.
-                Lower values are more conservative (fewer, larger attractors),
-                higher values allow for more, smaller attractors.
-        
+            trajectory: List of (i, j) points representing the trajectory
+            
         Returns:
-            tuple: (attractors, basins)
+            dict: Features of the trajectory
         """
-        trajectories = self.analyze_vector_field(sensitivity=sensitivity)
-        return self.find_attractors_and_basins(trajectories, sensitivity=sensitivity)
+        if len(trajectory) < 3:
+            return None
+            
+        # Convert to continuous coordinates
+        points = np.array([(self.X_fine[i,j], self.Y_fine[i,j]) for i,j in trajectory])
+        
+        # Compute endpoint
+        endpoint = points[-1]
+        
+        # Compute flow speed at endpoint
+        end_i, end_j = trajectory[-1]
+        end_speed = np.hypot(self.U_fine[end_i, end_j], self.V_fine[end_i, end_j])
+        
+        # Compute center of mass of trajectory
+        center = np.mean(points, axis=0)
+        
+        # Compute average distance from center (helps identify spiral vs straight paths)
+        distances_from_center = np.linalg.norm(points - center, axis=1)
+        avg_radius = np.mean(distances_from_center)
+        radius_std = np.std(distances_from_center)
+        
+        # Compute path properties
+        segments = np.diff(points, axis=0)
+        segment_lengths = np.linalg.norm(segments, axis=1)
+        total_length = np.sum(segment_lengths)
+        
+        # Compute average speed along trajectory
+        speeds = np.array([
+            np.hypot(self.U_fine[i,j], self.V_fine[i,j])
+            for i,j in trajectory
+        ])
+        avg_speed = np.mean(speeds)
+        min_speed = np.min(speeds)
+        
+        return {
+            'endpoint': endpoint,
+            'end_speed': end_speed,
+            'center': center,
+            'avg_radius': avg_radius,
+            'radius_std': radius_std,
+            'total_length': total_length,
+            'avg_speed': avg_speed,
+            'min_speed': min_speed
+        }
+
+    def compute_trajectory_similarity(self, features1, features2):
+        """
+        Compute similarity between two trajectories based on their features.
+        Returns a similarity score between 0 and 1.
+        """
+        if features1 is None or features2 is None:
+            return 0.0
+            
+        # Weight parameters - these can be tuned
+        w_endpoint = 1.0
+        w_center = 0.5
+        w_speed = 2.0  # Higher weight on speed characteristics
+        w_shape = 0.5
+        
+        # Normalize distances by the characteristic length of the field
+        field_size = np.sqrt(
+            (self.x_fine.max() - self.x_fine.min())**2 +
+            (self.y_fine.max() - self.y_fine.min())**2
+        )
+        
+        # Endpoint proximity (normalized by field size)
+        endpoint_dist = np.linalg.norm(features1['endpoint'] - features2['endpoint']) / field_size
+        endpoint_sim = np.exp(-endpoint_dist)
+        
+        # Center proximity (normalized)
+        center_dist = np.linalg.norm(features1['center'] - features2['center']) / field_size
+        center_sim = np.exp(-center_dist)
+        
+        # Speed similarity (both endpoint and average)
+        speed_sim = np.exp(-np.abs(features1['end_speed'] - features2['end_speed']))
+        avg_speed_sim = np.exp(-np.abs(features1['avg_speed'] - features2['avg_speed']))
+        min_speed_sim = np.exp(-np.abs(features1['min_speed'] - features2['min_speed']))
+        
+        # Shape similarity (using radius statistics)
+        radius_sim = np.exp(-np.abs(features1['avg_radius'] - features2['avg_radius']) / field_size)
+        radius_std_sim = np.exp(-np.abs(features1['radius_std'] - features2['radius_std']) / field_size)
+        
+        # Combine similarities with weights
+        similarity = (
+            w_endpoint * endpoint_sim +
+            w_center * center_sim +
+            w_speed * (speed_sim + avg_speed_sim + min_speed_sim) / 3 +
+            w_shape * (radius_sim + radius_std_sim) / 2
+        ) / (w_endpoint + w_center + w_speed + w_shape)
+        
+        return similarity
+
+    def cluster_trajectories(self, trajectories, min_samples=5, similarity_threshold=0.7):
+        """
+        Cluster trajectories using custom similarity metric.
+        """
+        # Compute features for all trajectories
+        trajectory_features = [self.compute_trajectory_features(traj) for traj in trajectories]
+        
+        # Create similarity matrix
+        n_trajectories = len(trajectories)
+        similarity_matrix = np.zeros((n_trajectories, n_trajectories))
+        
+        for i in range(n_trajectories):
+            for j in range(i+1, n_trajectories):
+                sim = self.compute_trajectory_similarity(
+                    trajectory_features[i],
+                    trajectory_features[j]
+                )
+                similarity_matrix[i,j] = sim
+                similarity_matrix[j,i] = sim
+            similarity_matrix[i,i] = 1.0
+            
+        # Convert similarity to distance for DBSCAN
+        distance_matrix = 1 - similarity_matrix
+        
+        # Perform DBSCAN clustering
+        clustering = DBSCAN(
+            metric='precomputed',
+            eps=1 - similarity_threshold,
+            min_samples=min_samples
+        ).fit(distance_matrix)
+        
+        return clustering.labels_, trajectory_features
 
     def plot_results(self, attractors, basins):
         plt.figure(figsize=(12, 10))
@@ -1051,7 +1511,7 @@ class VectorFieldProcessor:
         
         # Process clusters and identify attractors
         attractors = []
-        valid_labels = {}  # Map DBSCAN labels to new indices
+        valid_labels = {}  # Dictionary to map DBSCAN labels to new attractor indices
         new_label = 0
         
         for label in unique_labels:
